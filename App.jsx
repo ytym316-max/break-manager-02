@@ -1,0 +1,405 @@
+import { useState, useEffect, useRef } from "react";
+
+// ── Constants ──────────────────────────────────────────────
+const OVERTIME_H = 17, OVERTIME_M = 15;
+const MULTIPLIER = 1.25;
+const REGULAR_WORK_SEC = 7 * 3600 + 45 * 60; // 27900s
+const BREAK_RATIO = 5 / 60;
+const BASE_GOAL_SEC = Math.round(REGULAR_WORK_SEC * BREAK_RATIO); // 2325s = 38m45s
+const LS_TODAY = "bm_today";
+const LS_RUNNING = "bm_running"; // { startedAt: ISO string, startOT: bool }
+
+// ── Helpers ────────────────────────────────────────────────
+function todayKey() {
+  const d = new Date();
+  return `bm:${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+}
+function keyFromYMD(y, m, d) {
+  return `bm:${y}-${String(m+1).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
+}
+function isWeekday(date) { const d = date.getDay(); return d !== 0 && d !== 6; }
+function isOvertime(date) {
+  return date.getHours() > OVERTIME_H || (date.getHours() === OVERTIME_H && date.getMinutes() >= OVERTIME_M);
+}
+function fmt(sec) {
+  if (sec < 0) sec = 0;
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
+  return `${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
+}
+function fmtMin(sec) {
+  if (sec <= 0) return "0秒";
+  const m = Math.floor(Math.abs(sec) / 60);
+  const s = Math.abs(sec) % 60;
+  return m > 0 ? `${m}分${s > 0 ? s + "秒" : ""}` : `${s}秒`;
+}
+function dateLabel(y, m, d) {
+  return new Date(y, m, d).toLocaleDateString("ja-JP", { year:"numeric", month:"long", day:"numeric", weekday:"short" });
+}
+
+// ── localStorage helpers ───────────────────────────────────
+function lsGet(key) {
+  try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : null; } catch { return null; }
+}
+function lsSet(key, val) {
+  try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
+}
+function lsRemove(key) {
+  try { localStorage.removeItem(key); } catch {}
+}
+function listDayKeys() {
+  const keys = [];
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k && k.startsWith("bm:")) keys.push(k);
+  }
+  return keys.sort().reverse();
+}
+function loadDay(key) { return lsGet(key); }
+function saveDay(key, data) { lsSet(key, data); }
+
+const WEEKDAYS = ["日","月","火","水","木","金","土"];
+const C = {
+  brk: "#34d399", ot: "#fb923c",
+  dim: "#52525b", bg: "#0c0c10", panel: "#111117",
+  border: "#1e1e2a", text: "#d4d4d8",
+};
+
+// ── App ────────────────────────────────────────────────────
+export default function App() {
+  const [tab, setTab] = useState("timer");
+  const [now, setNow] = useState(new Date());
+  // Running state: null or { startedAt: Date, wasOT: bool }
+  const [running, setRunning] = useState(() => {
+    const r = lsGet(LS_RUNNING);
+    if (r) return { startedAt: new Date(r.startedAt), wasOT: r.wasOT };
+    return null;
+  });
+  const [elapsed, setElapsed] = useState(0);
+  const [todayData, setTodayData] = useState(() => {
+    const key = todayKey();
+    return lsGet(key) || { sessions: [], breakRawSec: 0, breakEffSec: 0 };
+  });
+  // Calendar
+  const [calYear, setCalYear] = useState(new Date().getFullYear());
+  const [calMonth, setCalMonth] = useState(new Date().getMonth());
+  const [recordedKeys, setRecordedKeys] = useState(() => new Set(listDayKeys()));
+  const [selectedDay, setSelectedDay] = useState(null);
+  const intervalRef = useRef(null);
+
+  // Clock + elapsed ticker (start-time based — accurate after background)
+  useEffect(() => {
+    const tick = () => {
+      const n = new Date();
+      setNow(n);
+      if (running) {
+        setElapsed(Math.floor((n - running.startedAt) / 1000));
+      }
+    };
+    tick();
+    intervalRef.current = setInterval(tick, 1000);
+    return () => clearInterval(intervalRef.current);
+  }, [running]);
+
+  const start = () => {
+    const startedAt = new Date();
+    const wasOT = isOvertime(startedAt);
+    const r = { startedAt, wasOT };
+    setRunning(r);
+    setElapsed(0);
+    lsSet(LS_RUNNING, { startedAt: startedAt.toISOString(), wasOT });
+  };
+
+  const stop = () => {
+    if (!running) return;
+    const endedAt = new Date();
+    const raw = Math.floor((endedAt - running.startedAt) / 1000);
+    const ot = running.wasOT || isOvertime(endedAt);
+    const effective = ot ? Math.round(raw * MULTIPLIER) : raw;
+
+    const session = {
+      raw, effective, overtime: ot,
+      startedAt: running.startedAt.toLocaleTimeString("ja-JP", { hour:"2-digit", minute:"2-digit" }),
+      endedAt: endedAt.toLocaleTimeString("ja-JP", { hour:"2-digit", minute:"2-digit" }),
+    };
+
+    const key = todayKey();
+    setTodayData(prev => {
+      const next = {
+        sessions: [session, ...(prev?.sessions || [])],
+        breakRawSec: (prev?.breakRawSec || 0) + raw,
+        breakEffSec: (prev?.breakEffSec || 0) + effective,
+      };
+      saveDay(key, next);
+      setRecordedKeys(k => new Set([...k, key]));
+      return next;
+    });
+
+    lsRemove(LS_RUNNING);
+    setRunning(null);
+    setElapsed(0);
+  };
+
+  const resetToday = () => {
+    const empty = { sessions: [], breakRawSec: 0, breakEffSec: 0 };
+    saveDay(todayKey(), empty);
+    setTodayData(empty);
+    lsRemove(LS_RUNNING);
+    setRunning(null);
+    setElapsed(0);
+  };
+
+  // Derived
+  const td = todayData;
+  const liveOT = running ? (running.wasOT || isOvertime(now)) : false;
+  const liveEff = running ? (liveOT ? Math.round(elapsed * MULTIPLIER) : elapsed) : 0;
+  const breakEffLive = td.breakEffSec + liveEff;
+  const deficit = BASE_GOAL_SEC - breakEffLive;
+  const achieved = deficit <= 0;
+  const pct = Math.min(100, BASE_GOAL_SEC > 0 ? (breakEffLive / BASE_GOAL_SEC) * 100 : 0);
+  const ot = isOvertime(now);
+
+  return (
+    <div style={{ minHeight:"100vh", background:C.bg, color:C.text, fontFamily:"'DM Mono', monospace", display:"flex", flexDirection:"column", alignItems:"center", padding:"32px 16px 60px" }}>
+
+      {/* Clock */}
+      <div style={{ textAlign:"center", marginBottom:24 }}>
+        <div style={{ fontSize:9, letterSpacing:5, color:C.dim, marginBottom:4 }}>BREAK MANAGER</div>
+        <div style={{ fontSize:30, fontWeight:700, letterSpacing:3, color:ot?C.ot:"#e4e4e7", transition:"color .6s", fontVariantNumeric:"tabular-nums" }}>
+          {now.toLocaleTimeString("ja-JP",{hour:"2-digit",minute:"2-digit",second:"2-digit"})}
+        </div>
+        <div style={{ fontSize:9, letterSpacing:2, marginTop:4, color:ot?C.ot:C.dim }}>
+          {ot ? `▲ 残業時間帯 — 休憩 ×${MULTIPLIER}` : "08:30〜17:15"}
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div style={{ display:"flex", marginBottom:20, border:`1px solid ${C.border}`, borderRadius:10, overflow:"hidden" }}>
+        {["timer","history"].map(t => (
+          <button key={t} onClick={() => { setTab(t); if(t==="history") setSelectedDay(null); }} style={{
+            padding:"8px 28px", background:tab===t?C.border:"transparent",
+            border:"none", color:tab===t?"#e4e4e7":C.dim,
+            fontSize:10, letterSpacing:3, cursor:"pointer", fontFamily:"inherit",
+          }}>{t==="timer"?"TIMER":"HISTORY"}</button>
+        ))}
+      </div>
+
+      {tab === "timer" && <>
+        {/* Goal */}
+        <div style={{ width:"100%", maxWidth:380, background:C.panel, border:`1px solid ${achieved?"#14532d":"#3b1b1b"}`, borderRadius:14, padding:"18px 22px", marginBottom:14 }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:10 }}>
+            <span style={{ fontSize:9, letterSpacing:3, color:C.dim }}>TODAY'S GOAL</span>
+            <span style={{ fontSize:9, letterSpacing:2, color:achieved?C.brk:C.ot }}>{achieved?"✓ ACHIEVED":"NOT YET"}</span>
+          </div>
+          <div style={{ height:6, background:"#1e1e2a", borderRadius:3, marginBottom:10, overflow:"hidden" }}>
+            <div style={{ height:"100%", borderRadius:3, width:`${pct}%`, background:achieved?C.brk:C.ot, transition:"width .5s ease" }} />
+          </div>
+          <div style={{ display:"flex", justifyContent:"space-between", fontSize:11 }}>
+            <span style={{ color:"#a1a1aa" }}>取得 <span style={{ color:achieved?C.brk:"#f4f4f5", fontWeight:700 }}>{fmtMin(breakEffLive)}</span></span>
+            <span style={{ color:C.dim }}>目標 {fmtMin(BASE_GOAL_SEC)}</span>
+          </div>
+          {!achieved && (
+            <div style={{ marginTop:8, fontSize:11, color:C.ot }}>あと <span style={{ fontWeight:700 }}>{fmtMin(deficit)}</span> 不足</div>
+          )}
+        </div>
+
+        {/* Timer */}
+        <div style={{ width:"100%", maxWidth:380, background:C.panel, border:`1px solid ${running?C.brk:C.border}`, borderRadius:14, padding:"28px 24px", textAlign:"center", marginBottom:14, transition:"border-color .4s" }}>
+          <div style={{ fontSize:10, letterSpacing:4, color:running?C.brk:C.dim, marginBottom:18, transition:"color .4s" }}>
+            {running ? "— 休憩中 —" : "— 待機中 —"}
+          </div>
+          <div style={{ fontSize:60, fontWeight:700, letterSpacing:2, color:running?"#f4f4f5":"#2a2a32", marginBottom:6, fontVariantNumeric:"tabular-nums", transition:"color .4s" }}>
+            {fmt(elapsed)}
+          </div>
+          {running && liveOT && elapsed > 0 && (
+            <div style={{ fontSize:13, color:C.ot, marginBottom:4 }}>換算: {fmt(Math.round(elapsed*MULTIPLIER))}</div>
+          )}
+          {running
+            ? <div style={{ fontSize:10, color:C.dim, marginBottom:22 }}>開始 {running.startedAt.toLocaleTimeString("ja-JP",{hour:"2-digit",minute:"2-digit"})}</div>
+            : <div style={{ marginBottom:22 }} />
+          }
+          <div style={{ display:"flex", gap:10, justifyContent:"center" }}>
+            {!running
+              ? <Btn onClick={start} color={C.brk} label="▶ 休憩開始" wide />
+              : <Btn onClick={stop} color="#ef4444" label="■ 終了" wide />
+            }
+            <Btn onClick={resetToday} color="#3f3f46" label="↺" />
+          </div>
+        </div>
+
+        {/* Log */}
+        {td.sessions.length > 0 && (
+          <div style={{ width:"100%", maxWidth:380, background:C.panel, border:`1px solid ${C.border}`, borderRadius:14, padding:"18px 20px" }}>
+            <div style={{ fontSize:9, letterSpacing:3, color:C.dim, marginBottom:12 }}>LOG</div>
+            <div style={{ maxHeight:200, overflowY:"auto", display:"flex", flexDirection:"column", gap:5 }}>
+              {td.sessions.map((s,i) => (
+                <div key={i} style={{ display:"grid", gridTemplateColumns:"1fr auto", gap:"0 10px", alignItems:"center", fontSize:11, padding:"7px 10px", background:C.bg, borderRadius:8, border:`1px solid ${s.overtime?"#431407":C.border}` }}>
+                  <span style={{ color:C.dim, fontSize:10 }}>{s.startedAt} → {s.endedAt}</span>
+                  <span>
+                    <span style={{ color:"#a1a1aa" }}>{fmtMin(s.raw)}</span>
+                    {s.overtime && <span style={{ color:C.ot, marginLeft:6 }}>→ {fmtMin(s.effective)}</span>}
+                  </span>
+                </div>
+              ))}
+            </div>
+            <div style={{ marginTop:10, fontSize:10, color:C.dim, textAlign:"right" }}>
+              合計（換算）<span style={{ color:"#a1a1aa", marginLeft:6 }}>{fmtMin(td.breakEffSec)}</span>
+            </div>
+          </div>
+        )}
+      </>}
+
+      {tab === "history" && !selectedDay && (
+        <CalendarView
+          year={calYear} month={calMonth}
+          recordedKeys={recordedKeys}
+          onPrev={() => { if(calMonth===0){setCalYear(y=>y-1);setCalMonth(11);}else setCalMonth(m=>m-1); }}
+          onNext={() => { if(calMonth===11){setCalYear(y=>y+1);setCalMonth(0);}else setCalMonth(m=>m+1); }}
+          onSelectDay={(y,m,d) => {
+            const k = keyFromYMD(y,m,d);
+            const data = loadDay(k);
+            if (data) setSelectedDay({ data, y, m, d });
+          }}
+        />
+      )}
+
+      {tab === "history" && selectedDay && (
+        <DayDetail info={selectedDay} onBack={() => setSelectedDay(null)} />
+      )}
+    </div>
+  );
+}
+
+// ── Calendar ───────────────────────────────────────────────
+function CalendarView({ year, month, recordedKeys, onPrev, onNext, onSelectDay }) {
+  const firstDay = new Date(year, month, 1).getDay();
+  const daysInMonth = new Date(year, month+1, 0).getDate();
+  const today = new Date();
+  const cells = [];
+  for (let i = 0; i < firstDay; i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) cells.push(d);
+
+  return (
+    <div style={{ width:"100%", maxWidth:380 }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
+        <button onClick={onPrev} style={navBtn()}>‹</button>
+        <span style={{ fontSize:13, letterSpacing:3, color:"#e4e4e7" }}>{year}年 {month+1}月</span>
+        <button onClick={onNext} style={navBtn()}>›</button>
+      </div>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(7,1fr)", gap:4, marginBottom:6 }}>
+        {WEEKDAYS.map((w,i) => (
+          <div key={w} style={{ textAlign:"center", fontSize:9, letterSpacing:1, color:i===0?"#f87171":i===6?"#60a5fa":C.dim, padding:"4px 0" }}>{w}</div>
+        ))}
+      </div>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(7,1fr)", gap:4 }}>
+        {cells.map((d,i) => {
+          if (!d) return <div key={i} />;
+          const date = new Date(year, month, d);
+          const k = keyFromYMD(year, month, d);
+          const recorded = recordedKeys.has(k);
+          const isToday = today.getFullYear()===year && today.getMonth()===month && today.getDate()===d;
+          const isSun = date.getDay()===0;
+
+          // Check achievement for recorded days
+          let achieved = false;
+          if (recorded) {
+            const data = loadDay(k);
+            if (data) achieved = data.breakEffSec >= BASE_GOAL_SEC;
+          }
+
+          return (
+            <div key={i} onClick={() => recorded && onSelectDay(year, month, d)}
+              style={{
+                aspectRatio:"1", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center",
+                background: recorded ? (achieved ? "#0f2318" : "#1a0f0f") : "transparent",
+                border: isToday ? `1px solid ${C.brk}` : `1px solid ${recorded ? (achieved?"#14532d":"#431407") : "transparent"}`,
+                borderRadius:8,
+                cursor: recorded ? "pointer" : "default",
+                color: recorded ? "#e4e4e7" : isSun ? "#7f1d1d" : C.dim,
+                fontSize:12, fontWeight:isToday?700:400,
+              }}
+            >
+              {d}
+              {recorded && (
+                <div style={{ width:4, height:4, borderRadius:"50%", background:achieved?C.brk:C.ot, marginTop:2 }} />
+              )}
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ marginTop:16, display:"flex", gap:16, justifyContent:"center", fontSize:9, color:C.dim, letterSpacing:1 }}>
+        <span><span style={{ color:C.brk }}>●</span> 達成</span>
+        <span><span style={{ color:C.ot }}>●</span> 未達</span>
+      </div>
+    </div>
+  );
+}
+
+function navBtn() {
+  return { background:"transparent", border:`1px solid ${C.border}`, borderRadius:8, color:"#a1a1aa", fontSize:18, width:36, height:36, cursor:"pointer", fontFamily:"inherit" };
+}
+
+// ── Day Detail ─────────────────────────────────────────────
+function DayDetail({ info, onBack }) {
+  const { data, y, m, d } = info;
+  const eff = data.breakEffSec;
+  const deficit = BASE_GOAL_SEC - eff;
+  const achieved = deficit <= 0;
+  const pct = Math.min(100, BASE_GOAL_SEC > 0 ? (eff/BASE_GOAL_SEC)*100 : 0);
+
+  return (
+    <div style={{ width:"100%", maxWidth:380 }}>
+      <button onClick={onBack} style={{ background:"transparent", border:"none", color:C.dim, fontSize:12, cursor:"pointer", letterSpacing:2, marginBottom:16, fontFamily:"inherit" }}>
+        ‹ 戻る
+      </button>
+      <div style={{ fontSize:13, color:"#e4e4e7", marginBottom:18 }}>{dateLabel(y, m, d)}</div>
+
+      <div style={{ background:C.panel, border:`1px solid ${achieved?"#14532d":"#3b1b1b"}`, borderRadius:14, padding:"18px 22px", marginBottom:14 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", marginBottom:10 }}>
+          <span style={{ fontSize:9, letterSpacing:3, color:C.dim }}>GOAL</span>
+          <span style={{ fontSize:9, letterSpacing:2, color:achieved?C.brk:C.ot }}>{achieved?"✓ 達成":"✗ 未達"}</span>
+        </div>
+        <div style={{ height:6, background:"#1e1e2a", borderRadius:3, marginBottom:10, overflow:"hidden" }}>
+          <div style={{ height:"100%", borderRadius:3, width:`${pct}%`, background:achieved?C.brk:C.ot }} />
+        </div>
+        <div style={{ display:"flex", justifyContent:"space-between", fontSize:11 }}>
+          <span style={{ color:"#a1a1aa" }}>取得 <span style={{ color:achieved?C.brk:"#f4f4f5", fontWeight:700 }}>{fmtMin(eff)}</span></span>
+          <span style={{ color:C.dim }}>目標 {fmtMin(BASE_GOAL_SEC)}</span>
+        </div>
+        {!achieved && <div style={{ marginTop:8, fontSize:11, color:C.ot }}>不足 <span style={{ fontWeight:700 }}>{fmtMin(deficit)}</span></div>}
+      </div>
+
+      <div style={{ background:C.panel, border:`1px solid ${C.border}`, borderRadius:14, padding:"18px 20px" }}>
+        <div style={{ fontSize:9, letterSpacing:3, color:C.dim, marginBottom:12 }}>LOG</div>
+        <div style={{ display:"flex", flexDirection:"column", gap:5 }}>
+          {data.sessions.map((s,i) => (
+            <div key={i} style={{ display:"grid", gridTemplateColumns:"1fr auto", gap:"0 10px", alignItems:"center", fontSize:11, padding:"7px 10px", background:C.bg, borderRadius:8, border:`1px solid ${s.overtime?"#431407":C.border}` }}>
+              <span style={{ color:C.dim, fontSize:10 }}>{s.startedAt} → {s.endedAt}</span>
+              <span>
+                <span style={{ color:"#a1a1aa" }}>{fmtMin(s.raw)}</span>
+                {s.overtime && <span style={{ color:C.ot, marginLeft:6 }}>→ {fmtMin(s.effective)}</span>}
+              </span>
+            </div>
+          ))}
+        </div>
+        <div style={{ marginTop:10, fontSize:10, color:C.dim, textAlign:"right" }}>
+          合計（換算）<span style={{ color:"#a1a1aa", marginLeft:6 }}>{fmtMin(data.breakEffSec)}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Btn({ onClick, color, label, wide }) {
+  const [h, setH] = useState(false);
+  return (
+    <button onClick={onClick} onMouseEnter={()=>setH(true)} onMouseLeave={()=>setH(false)} style={{
+      padding:"10px 20px", minWidth:wide?160:undefined,
+      background:h?color+"22":"transparent", border:`1px solid ${color}`,
+      borderRadius:8, color, fontSize:12, letterSpacing:2,
+      cursor:"pointer", fontFamily:"inherit", transition:"background .2s",
+    }}>{label}</button>
+  );
+}
